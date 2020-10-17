@@ -243,7 +243,6 @@ macro_rules! cmd {
 pub struct Cmd {
     args: Vec<OsString>,
     stdin_contents: Option<Vec<u8>>,
-    ignore_status: bool,
 }
 
 impl fmt::Display for Cmd {
@@ -275,11 +274,7 @@ impl Cmd {
         Cmd::_new(program.as_ref())
     }
     fn _new(program: &Path) -> Cmd {
-        Cmd {
-            args: vec![program.as_os_str().to_owned()],
-            stdin_contents: None,
-            ignore_status: false,
-        }
+        Cmd { args: vec![program.as_os_str().to_owned()], stdin_contents: None }
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Cmd {
@@ -307,11 +302,6 @@ impl Cmd {
         self.args.last_mut().unwrap().push(arg)
     }
 
-    pub fn ignore_status(mut self) -> Cmd {
-        self.ignore_status = true;
-        self
-    }
-
     pub fn stdin(mut self, stdin: impl AsRef<[u8]>) -> Cmd {
         self._stdin(stdin.as_ref());
         self
@@ -321,40 +311,26 @@ impl Cmd {
     }
 
     pub fn read(self) -> Result<String> {
-        self.read_stream(false)
-    }
-
-    pub fn read_stderr(self) -> Result<String> {
-        self.read_stream(true)
-    }
-
-    pub fn run(self) -> Result<()> {
-        println!("$ {}", self);
-        match self.command().status() {
-            Ok(status) if status.success() || self.ignore_status => Ok(()),
-            Ok(status) => Err(CmdErrorKind::NonZeroStatus(status).err(self)),
-            Err(io_err) => Err(CmdErrorKind::Io(io_err).err(self)),
+        {
+            let s = Self::mrun(&self.args).unwrap();
+            return Ok(s);
         }
-    }
 
-    fn read_stream(self, read_stderr: bool) -> Result<String> {
-        match self.output() {
-            Ok(output) if output.status.success() || self.ignore_status => {
-                let stream = if read_stderr { output.stderr } else { output.stdout };
-                let mut stream = String::from_utf8(stream)
-                    .map_err(|utf8_err| CmdErrorKind::NonUtf8Output(utf8_err).err(self))?;
-                if stream.ends_with('\n') {
-                    stream.pop();
+        match self.read_raw() {
+            Ok(output) if output.status.success() => {
+                let mut stdout = String::from_utf8(output.stdout)
+                    .map_err(|utf8_err| CmdErrorKind::NonUtf8Stdout(utf8_err).err(self))?;
+                if stdout.ends_with('\n') {
+                    stdout.pop();
                 }
 
-                Ok(stream)
+                Ok(stdout)
             }
             Ok(output) => Err(CmdErrorKind::NonZeroStatus(output.status).err(self)),
             Err(io_err) => Err(CmdErrorKind::Io(io_err).err(self)),
         }
     }
-
-    fn output(&self) -> io::Result<Output> {
+    fn read_raw(&self) -> io::Result<Output> {
         let mut child = self
             .command()
             .stdin(match &self.stdin_contents {
@@ -373,30 +349,82 @@ impl Cmd {
         child.wait_with_output()
     }
 
+    pub fn run(self) -> Result<()> {
+        println!("$ {}", self);
+        match self.command().status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(CmdErrorKind::NonZeroStatus(status).err(self)),
+            Err(io_err) => Err(CmdErrorKind::Io(io_err).err(self)),
+        }
+    }
+
     fn command(&self) -> std::process::Command {
         let mut res = std::process::Command::new(&self.args[0]);
         res.args(&self.args[1..]);
         res
     }
-}
 
-/// ```compile_fail
-/// let echo = "echo".to_string();
-/// xshell::cmd!("{echo.as_str()}");
-/// ```
-///
-/// ```compile_fail
-/// let args = &[""];
-/// xshell::cmd!("echo a{args...}");
-/// ```
-///
-/// ```compile_fail
-/// let args = &[""];
-/// xshell::cmd!("echo {args...}b");
-/// ```
-///
-/// ```
-/// let args = &[""];
-/// xshell::cmd!("echo a {args...} b");
-/// ```
-fn _compile_fail_tests() {}
+    fn mrun(cmd: &[std::ffi::OsString]) -> std::io::Result<String> {
+        use std::io::Read;
+        use std::process;
+
+        let cmd: Vec<&str> = cmd.iter().map(|c| c.to_str().unwrap()).collect();
+        let cmd = &cmd;
+
+        let mut stdin = None;
+
+        let runit = |stdin: Option<process::Child>,
+                     stdout: process::Stdio,
+                     cmd: &[&str]|
+         -> Option<process::Child> {
+            if cmd.is_empty() {
+                return None;
+            }
+
+            let mut cmd = cmd.iter();
+
+            let stdin = if let Some(stdin) = stdin { stdin.stdout } else { None };
+
+            if let Some(stdin) = stdin {
+                if let Ok(child) = process::Command::new(cmd.next()?)
+                    .args(&cmd.collect::<Vec<&&str>>())
+                    .stdin(stdin)
+                    .stdout(stdout)
+                    .spawn()
+                {
+                    Some(child)
+                } else {
+                    None
+                }
+            } else if let Ok(child) = process::Command::new(cmd.next()?)
+                .args(&cmd.collect::<Vec<&&str>>())
+                .stdout(stdout)
+                .spawn()
+            {
+                Some(child)
+            } else {
+                None
+            }
+        };
+
+        let mut cmd = cmd.split(|c| c == &"|").peekable();
+        while let Some(c) = cmd.next() {
+            let stdout = if cmd.peek().is_some() {
+                process::Stdio::piped()
+            } else {
+                process::Stdio::inherit()
+            };
+            stdin = runit(stdin, stdout, c);
+        }
+        // wait for the last command
+        if let Some(process) = stdin.as_mut() {
+            let _ = process.wait();
+            let mut out = Vec::new();
+            process.stdout.as_mut().unwrap().read_exact(&mut out).unwrap();
+
+            return Ok(String::from_utf8_lossy(&out).to_string());
+        } else {
+            Ok(String::new())
+        }
+    }
+}
